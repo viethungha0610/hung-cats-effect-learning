@@ -6,31 +6,23 @@ package com.rockthejvm.playground
   */
 object ConnectorExecutor {
 
-  val emailClient = new EmailClient
-  val slackClient = new SlackClient
+  // val emailClient = new EmailClient
+  // val slackClient = new SlackClient
   // val otherClient = new OtherClient
   // ...
 
-  // TODO - I would have this in a different file
+  // TODO - I would have these Connector classes and trait in a different file
+
+  // TODO - We could also create custom exception classes to fit the domain e.g. UnsupportedConnectorException, FailedExecutionException, etc.
 
   // Client can also potentially have a common interface and a method like `open` and `close` to manage lifecycle, prevent resource leak
-  trait BaseClient
-//  class EmailClient_v2 extends EmailClient with BaseClient
-//  class SlackClient_v2 extends SlackClient with BaseClient
 
   trait BaseConnector {
     // Common interface for connectors to be implemented
-    /*
-     * For a connector to work it needs to use this
-     *   - What the required client is? (resource)
-     *   - What operations are available
-     *   - How to map operation to the right method so the correct method is called?
-     * */
-
     // In this example, the operation returns a string, from experience, operations like this often executes side effects e.g. send a HTTP request, execute DB transaction
     // So we can also use cats-effect's IO monad to represent it, but I'll keep it as string on the right side here for simplicity
-    def open(): Unit
-    def close(): Unit
+    def open(): Unit = {}
+    def close(): Unit = {}
     def executeOperation(operationName: String, params: Map[String, String]): Either[Throwable, String]
   }
 
@@ -46,20 +38,28 @@ object ConnectorExecutor {
       // TODO - Close the email client's connection here
     }
 
-    override def executeOperation(operationName: String, params: Map[String, String]): Option[String] =
+    override def executeOperation(
+        operationName: String,
+        params: Map[String, String]
+    ): Either[Throwable, String] = {
+      val confEither = Option(ConfigurationRepository.findConnectorConfiguration("Slack"))
+        .toRight(new RuntimeException("failed to parse slack config"))
       operationName match {
-        case "SendEmail" => sendEmail(params)
-        case _           => None
+        case "SendEmail" => sendEmail(params, confEither)
+        case _           => Left(new IllegalArgumentException(s"$operationName operation is not supported!"))
       }
+    }
 
-    def sendEmail(params: Map[String, String]): Option[String] = {
-      val confOpt = Option(ConfigurationRepository.findConnectorConfiguration("Email"))
+    def sendEmail(
+        params: Map[String, String],
+        confEither: Either[RuntimeException, String]
+    ): Either[Throwable, String] = {
       for {
-        to <- params.get("to")
-        cc <- params.get("cc")
-        bcc <- params.get("bcc")
-        body <- params.get("body")
-        conf <- confOpt
+        to <- params.get("to").toRight(new RuntimeException("to could not be found!"))
+        cc <- params.get("cc").toRight(new RuntimeException("cc could not be found!"))
+        bcc <- params.get("bcc").toRight(new RuntimeException("bcc could not be found!"))
+        body <- params.get("body").toRight(new RuntimeException("body could not be found!"))
+        conf <- confEither
       } yield emailClient.sendEmail(to, cc, bcc, body, conf)
     }
   }
@@ -84,7 +84,7 @@ object ConnectorExecutor {
       operationName match {
         case "SendChannelMessage" => sendChannelMessage(params, confEither)
         case "SendPrivateMessage" => sendPrivateMessage(params, confEither)
-        case _                    => Left(new IllegalArgumentException(s"$operationName is not supported!"))
+        case _                    => Left(new IllegalArgumentException(s"$operationName operation is not supported!"))
       }
     }
 
@@ -93,8 +93,8 @@ object ConnectorExecutor {
         confEither: Either[RuntimeException, String]
     ): Either[Throwable, String] = {
       for {
-        channel <- params.get("channel").toRight(new IllegalArgumentException("channel could not be found!"))
-        message <- params.get("message").toRight(new IllegalArgumentException("message could not be found!"))
+        channel <- params.get("channel").toRight(new RuntimeException("channel could not be found!"))
+        message <- params.get("message").toRight(new RuntimeException("message could not be found!"))
         conf <- confEither
       } yield slackClient.sendChannelMessage(channel, message, conf)
     }
@@ -104,9 +104,8 @@ object ConnectorExecutor {
         confEither: Either[RuntimeException, String]
     ): Either[Throwable, String] = {
       for {
-        recipient <-
-          params.get("recipient").toRight(new IllegalArgumentException("recipient could not be found!"))
-        message <- params.get("message").toRight(new IllegalArgumentException("message could not be found"))
+        recipient <- params.get("recipient").toRight(new RuntimeException("recipient could not be found!"))
+        message <- params.get("message").toRight(new RuntimeException("message could not be found"))
         conf <- confEither
       } yield slackClient.sendPrivateMessage(recipient, message, conf)
     }
@@ -119,29 +118,39 @@ object ConnectorExecutor {
         case "Email" => Right(new EmailConnector)
         case "Slack" => Right(new SlackConnector)
         // Add more connectors below!
-        case _ => Left(new IllegalArgumentException(s"$connector is not supported!"))
+        case _ => Left(new IllegalArgumentException(s"$connector connector is not supported!"))
       }
   }
 
   /**
     * Don't change the signature of this function
     */
+  // If I could change the signature of this function, I would also add a client argument to inject the client
+  // So the client can be re-used in multiple executorConnector calls, instead of being created in open() method of Connector
+  // But maybe creating a client may be safer, e.g. temporary credentials contained by the client is refreshed each time
+  // The client should extend a common trait e.g. BaseClient
   def executeConnector(connector: String, operation: String, params: Map[String, String]): String = {
     val maybeConnectorOutput = for {
       connector <- ConnectorFactory(connector)
-      output <- connector.executeOperation(operation, params)
+      output <- {
+        connector.open()
+        val outputEither = connector.executeOperation(operation, params)
+        connector.close()
+        outputEither
+      }
     } yield output
 
     maybeConnectorOutput match {
-      case Right(output)   => output
+      case Right(output)   =>
+        output
       case Left(exception) =>
-        // TODO - add plenty of logging here, maybe also error callback
+        // TODO - add logging here, maybe also error callback
         // TODO - I would also use something like org.apache.commons.lang3.exception.ExceptionUtils to properly log error and stacktrace
         // TODO - I would also use scala-logging's StrictLogging instead of println
         println(s"""
             |Something has gone wrong when executing the Connector
             |Message: ${exception.getMessage}
-            |Stacktrace: ExceptionUtils.getStacktrace(exception) <- I would do this
+            |Stacktrace: ExceptionUtils.getStacktrace(exception) <- I would also do this
             |""".stripMargin)
         "ERROR"
     }
